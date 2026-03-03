@@ -1,0 +1,17 @@
+# FlashInfer Bench contest dependencies
+# NOTE: flashinfer-bench must be installed with --no-deps on macOS
+#       because it depends on flashinfer-python which requires CUDA.
+#       Run: pip install --no-deps flashinfer-bench
+flashinfer-bench
+modal
+
+# Core ML libraries
+torch
+numpy
+
+# flashinfer-bench transitive deps (installed manually due to --no-deps)
+pydantic
+safetensors
+packaging
+apache-tvm-ffi
+docstring-parser
