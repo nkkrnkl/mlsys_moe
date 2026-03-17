@@ -1,6 +1,9 @@
 # FlashInfer Competition
 solution.json
 
+# Agent optimization state (large, ephemeral)
+agent_state/
+
 # CUDA build artifacts
 *.o
 *.obj

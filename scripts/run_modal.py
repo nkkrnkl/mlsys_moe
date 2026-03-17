@@ -102,6 +102,38 @@ def print_results(results: dict):
             print()
 
 
+@app.function(image=image, gpu="B200:1", timeout=600, volumes={TRACE_SET_PATH: trace_volume})
+def run_ncu_on_modal(solution: Solution, workload_uuid: str, ncu_set: str = "detailed") -> str:
+    """
+    Run Nsight Compute profiling on a specific workload and return raw NCU text.
+    Used by the agent optimization loop to get performance metrics.
+    """
+    from flashinfer_bench.agents import flashinfer_bench_run_ncu
+
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+
+    if solution.definition not in trace_set.definitions:
+        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+
+    workloads = trace_set.workloads.get(solution.definition, [])
+    workload = next(
+        (w for w in workloads if str(w.uuid) == workload_uuid),
+        None,
+    )
+    if workload is None:
+        # Fall back to first workload if UUID not found
+        if not workloads:
+            raise ValueError(f"No workloads for '{solution.definition}'")
+        workload = workloads[0]
+
+    return flashinfer_bench_run_ncu(
+        solution=solution,
+        workload=workload,
+        set=ncu_set,
+        page="details",
+    )
+
+
 @app.local_entrypoint()
 def main():
     """Pack solution and run benchmark on Modal."""
