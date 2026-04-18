@@ -319,7 +319,11 @@ def swiglu_kernel(
 # Uses tl.atomic_add scatter — required because top-8 routing means
 # multiple experts contribute to the same output token row.
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_gemm_configs(), key=["n_assigned_bucket", "N"])
+@triton.autotune(
+    configs=_gemm_configs(),
+    key=["n_assigned_bucket", "N"],
+    reset_to_zero=("output_ptr",),
+)
 @triton.jit
 def grouped_gemm2_kernel(
     # Sorted token data
