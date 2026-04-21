@@ -290,42 +290,43 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
         except Exception as e:
             lines.append(f"  (internal inspect failed: {e})")
 
-        # ---- Isolate GEMM1: call grouped_gemm1_kernel directly and compare to PyTorch ----
+        # ---- Isolate fused GEMM1+SwiGLU and compare to PyTorch ----
         try:
             import triton
             H_, I_, BLK = 7168, 2048, 128
             GATE_UP_DIM_ = I_ * 2
             if N_assigned_dbg > 0:
-                # Kernel version: call grouped_gemm1_kernel into a fresh buffer
-                gate_up_kern = torch.empty(N_assigned_dbg, GATE_UP_DIM_, dtype=torch.float32, device="cuda")
                 hs_t = tensors["hidden_states"]
                 hss_t = tensors["hidden_states_scale"]
                 w1_t = tensors["gemm1_weights"]
                 w1s_t = tensors["gemm1_weights_scale"]
+
+                # Kernel path: fused GEMM1+SwiGLU writes inter directly
+                inter_kern = torch.empty(N_assigned_dbg, I_, dtype=torch.float32, device="cuda")
                 mod.grouped_gemm1_kernel[
                     lambda meta: (
                         32 * triton.cdiv(max_tok_dbg, meta["BLOCK_M"]),
-                        triton.cdiv(GATE_UP_DIM_, meta["BLOCK_N"]),
+                        triton.cdiv(I_, meta["BLOCK_N"]),
                     )
                 ](
                     sorted_tok_ids_dbg, expert_offsets_dbg, max_tok_dbg,
                     hs_t, hss_t,
                     w1_t, w1s_t,
-                    gate_up_kern,
+                    inter_kern,
                     N_assigned_dbg,
                     _bkt(N_assigned_dbg),
                     K=H_,
-                    N=GATE_UP_DIM_,
+                    N=I_,
                     stride_h_seq      = hs_t.stride(0),
                     stride_w1_exp     = w1_t.stride(0),
                     stride_w1_n       = w1_t.stride(1),
                     stride_w1s_exp    = w1s_t.stride(0),
                     stride_w1s_nb     = w1s_t.stride(1),
                     stride_hscale_blk = hss_t.stride(0),
-                    stride_gu_tok     = gate_up_kern.stride(0),
+                    stride_inter_tok  = inter_kern.stride(0),
                 )
 
-                # Reference version: pytorch equivalent
+                # Reference: compute gate_up (full 4096) in pytorch, then SwiGLU
                 gate_up_ref = torch.zeros(N_assigned_dbg, GATE_UP_DIM_, dtype=torch.float32, device="cuda")
                 for le in range(32):
                     es = int(expert_offsets_dbg[le].item())
@@ -341,26 +342,20 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
                     w1_dq = (w1e * w1se[:, None, :, None]).view(GATE_UP_DIM_, H_)
                     gate_up_ref[es:ee] = h_dq @ w1_dq.T
 
-                # ---- Isolate SwiGLU: run Triton swiglu_kernel vs pytorch ----
-                inter_kern = torch.empty(N_assigned_dbg, I_, dtype=torch.float32, device="cuda")
-                SWIGLU_BLOCK = 1024
-                mod.swiglu_kernel[triton.cdiv(N_assigned_dbg * I_, SWIGLU_BLOCK),](
-                    gate_up_ref, inter_kern,
-                    N_assigned_dbg,
-                    INTER_DIM=I_,
-                    BLOCK_SIZE=SWIGLU_BLOCK,
-                )
                 # pytorch SwiGLU: first_half=up=gate_up[:, :I], second_half=gate=gate_up[:, I:]
                 X1 = gate_up_ref[:, :I_]
                 X2 = gate_up_ref[:, I_:]
                 inter_py = (X2 / (1.0 + torch.exp(-X2))) * X1
 
                 diff_sw = (inter_kern - inter_py).abs()
-                lines.append(f"\n=== SwiGLU isolation: Triton vs PyTorch ===")
+                lines.append(f"\n=== GEMM1+SwiGLU fused isolation: Triton vs PyTorch ===")
                 lines.append(f"  inter_kern:  min={float(inter_kern.min()):.4e}, max={float(inter_kern.max()):.4e}, mean_abs={float(inter_kern.abs().mean()):.4e}")
                 lines.append(f"  inter_py  :  min={float(inter_py.min()):.4e}, max={float(inter_py.max()):.4e}, mean_abs={float(inter_py.abs().mean()):.4e}")
                 lines.append(f"  max_abs_err : {float(diff_sw.max()):.4e}")
                 lines.append(f"  mean_abs_err: {float(diff_sw.mean()):.4e}")
+                # Sample values for sanity
+                lines.append(f"  kern[0, :4]: {inter_kern[0, :4].tolist()}")
+                lines.append(f"  py  [0, :4]: {inter_py[0, :4].tolist()}")
 
                 # ---- Isolate GEMM2: run Triton grouped_gemm2_kernel vs pytorch ----
                 output_kern_gemm2 = torch.zeros(seq_len, H_, dtype=torch.float32, device="cuda")
@@ -408,24 +403,9 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
                 lines.append(f"  out_py  :  min={float(output_py_gemm2.min()):.4e}, max={float(output_py_gemm2.max()):.4e}, mean_abs={float(output_py_gemm2.abs().mean()):.4e}")
                 lines.append(f"  max_abs_err : {float(diff_g2.max()):.4e}")
                 lines.append(f"  mean_abs_err: {float(diff_g2.mean()):.4e}")
-
-                diff1 = (gate_up_kern - gate_up_ref).abs()
-                lines.append(f"\n=== GEMM1 isolation: kernel vs PyTorch ===")
-                lines.append(f"  gate_up_kern:  min={float(gate_up_kern.min()):.4e}, max={float(gate_up_kern.max()):.4e}, mean_abs={float(gate_up_kern.abs().mean()):.4e}")
-                lines.append(f"  gate_up_ref :  min={float(gate_up_ref.min()):.4e}, max={float(gate_up_ref.max()):.4e}, mean_abs={float(gate_up_ref.abs().mean()):.4e}")
-                lines.append(f"  max_abs_err : {float(diff1.max()):.4e}")
-                lines.append(f"  mean_abs_err: {float(diff1.mean()):.4e}")
-                # Sample values at (row=0, col=0..3)
-                lines.append(f"  kern[0, :4]: {gate_up_kern[0, :4].tolist()}")
-                lines.append(f"  ref [0, :4]: {gate_up_ref[0, :4].tolist()}")
-                # Ratio
-                nonzero = gate_up_ref.abs() > 1e-3
-                if nonzero.any():
-                    ratio = (gate_up_kern[nonzero] / gate_up_ref[nonzero]).abs()
-                    lines.append(f"  |kern/ref| ratio: min={float(ratio.min()):.4e}, median={float(ratio.median()):.4e}, max={float(ratio.max()):.4e}")
         except Exception as e:
             import traceback
-            lines.append(f"\n=== GEMM1 isolation failed: {e}\n{traceback.format_exc()}")
+            lines.append(f"\n=== Isolation failed: {e}\n{traceback.format_exc()}")
 
         # Run our kernel
         H = 7168
