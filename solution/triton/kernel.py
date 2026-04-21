@@ -263,10 +263,10 @@ def grouped_gemm1_kernel(
             mask=n_mask, other=1.0,
         )
 
-        # Dequant to float32, then dot — numerically matches baseline
-        h_f32 = h_fp8.to(tl.float32) * h_scales[:, None]   # [BM, BK]
-        w_f32 = w_fp8.to(tl.float32) * w_scales[:, None]   # [BN, BK]
-        acc  += tl.dot(h_f32, tl.trans(w_f32), out_dtype=tl.float32)
+        # Native FP8 MMA into fp32 TC accumulator; DeepSeek-V3 N_C=128 two-level
+        # promotion — drain per 128-K block via outer scale product.
+        acc_block = tl.dot(h_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
+        acc      += acc_block * h_scales[:, None] * w_scales[None, :]
 
     out_m    = e_start + m_range
     out_ptrs = gate_up_ptr + out_m[:, None] * stride_gu_tok + n_range[None, :]
