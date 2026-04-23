@@ -307,10 +307,17 @@ def grouped_gemm1_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2: Grouped GEMM2
+# Kernel 2: Grouped GEMM2 — PERSISTENT scheduler
 #
 # output_f32[tok_ids[m]] += (r_scores[m] * rsf) × inter[m] @ w2[expert].T
 # for all 32 local experts in a single launch.
+#
+# Persistent schedule: grid = (NUM_SMS,). Each CTA precomputes per-expert
+# m-tile counts from expert_offsets (32-wide vector op, in-register), does
+# a prefix sum to build tile_id → (expert_id, m_in_expert) lookup, then
+# loops tile_id = pid, pid+NUM_SMS, pid+2·NUM_SMS, ... until total_tiles.
+# This eliminates the tail-quantization waste from the old grid-by-max_tok
+# approach: imbalanced experts no longer strand whole CTAs on early return.
 #
 # Uses tl.atomic_add scatter — required because top-8 routing means
 # multiple experts contribute to the same output token row.
@@ -325,8 +332,7 @@ def grouped_gemm2_kernel(
     # Sorted token data
     sorted_tok_ids_ptr,
     sorted_r_scores_ptr,
-    expert_offsets_ptr,
-    max_tok,
+    expert_offsets_ptr,    # [E+1] int32
 
     # Intermediate (SwiGLU output)
     inter_ptr,             # [N_assigned, 2048] float32
@@ -345,6 +351,7 @@ def grouped_gemm2_kernel(
     # Shape constants
     K: tl.constexpr,       # 2048
     N: tl.constexpr,       # 7168
+    E: tl.constexpr,       # 32 (NUM_LOCAL_EXPERTS)
 
     # Strides
     stride_inter_tok,
@@ -354,69 +361,84 @@ def grouped_gemm2_kernel(
     stride_w2s_nb,
     stride_out_seq,
 
-    # Block sizes
+    # Block sizes + persistent parallelism
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
 
-    tiles_per_expert = tl.cdiv(max_tok, BLOCK_M)
-    expert_id        = pid_m // tiles_per_expert
-    m_in_expert      = pid_m %  tiles_per_expert
+    # Per-expert m-tile prefix (cheap, 32-wide vector, all registers).
+    idx_e       = tl.arange(0, E)
+    starts      = tl.load(expert_offsets_ptr + idx_e)       # [E]
+    ends        = tl.load(expert_offsets_ptr + idx_e + 1)   # [E]
+    counts      = ends - starts                              # [E]
+    mtiles      = tl.cdiv(counts, BLOCK_M)                   # [E]  m-tiles per expert
+    prefix_inc  = tl.cumsum(mtiles, axis=0)                  # [E]  inclusive
+    prefix_exc  = prefix_inc - mtiles                         # [E]  exclusive (start of each expert)
+    total_m_tiles = tl.sum(mtiles, axis=0)                    # scalar
 
-    e_start      = tl.load(expert_offsets_ptr + expert_id)
-    e_end        = tl.load(expert_offsets_ptr + expert_id + 1)
-    n_expert_tok = e_end - e_start
+    n_tiles     = tl.cdiv(N, BLOCK_N)
+    total_tiles = total_m_tiles * n_tiles
 
-    m_off = m_in_expert * BLOCK_M
-    if m_off >= n_expert_tok:
-        return
+    # Persistent loop over flat tile_id.
+    for tile_id in tl.range(pid, total_tiles, NUM_SMS):
+        m_tile_id = tile_id // n_tiles
+        n_tile_id = tile_id %  n_tiles
 
-    m_range  = m_off + tl.arange(0, BLOCK_M)
-    m_mask   = m_range < n_expert_tok
-    global_m = e_start + m_range
+        # expert_id = how many experts have their inclusive prefix <= m_tile_id.
+        expert_id = tl.sum((prefix_inc <= m_tile_id).to(tl.int32), axis=0)
+        # Pick prefix_exc[expert_id], starts[expert_id], counts[expert_id] via masked sum.
+        sel           = (idx_e == expert_id).to(tl.int32)
+        m_tile_base   = tl.sum(prefix_exc * sel, axis=0)
+        e_start       = tl.sum(starts     * sel, axis=0)
+        n_expert_tok  = tl.sum(counts     * sel, axis=0)
 
-    tok_ids  = tl.load(sorted_tok_ids_ptr  + global_m, mask=m_mask, other=0)
-    r_scores = tl.load(sorted_r_scores_ptr + global_m, mask=m_mask, other=0.0)
-    weight   = r_scores * routed_scaling_factor
+        m_in_expert = m_tile_id - m_tile_base
+        m_off       = m_in_expert * BLOCK_M
+        m_range     = m_off + tl.arange(0, BLOCK_M)
+        m_mask      = m_range < n_expert_tok
+        global_m    = e_start + m_range
 
-    n_start  = pid_n * BLOCK_N
-    n_range  = n_start + tl.arange(0, BLOCK_N)
-    n_mask   = n_range < N
-    n_blks   = n_range // BLOCK_K
+        tok_ids  = tl.load(sorted_tok_ids_ptr  + global_m, mask=m_mask, other=0)
+        r_scores = tl.load(sorted_r_scores_ptr + global_m, mask=m_mask, other=0.0)
+        weight   = r_scores * routed_scaling_factor
 
-    w2_base  = w2_ptr      + expert_id * stride_w2_exp
-    w2s_base = w2scale_ptr + expert_id * stride_w2s_exp
+        n_start  = n_tile_id * BLOCK_N
+        n_range  = n_start + tl.arange(0, BLOCK_N)
+        n_mask   = n_range < N
+        n_blks   = n_range // BLOCK_K
 
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        w2_base  = w2_ptr      + expert_id * stride_w2_exp
+        w2s_base = w2scale_ptr + expert_id * stride_w2s_exp
 
-    for k_start in tl.range(0, K, BLOCK_K):
-        k_blk   = k_start // BLOCK_K
-        k_range = k_start + tl.arange(0, BLOCK_K)
-        k_mask  = k_range < K
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-        # Load intermediate (float32) — no BF16 cast, matches baseline precision
-        i_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + k_range[None, :]
-        i_f32  = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        for k_start in tl.range(0, K, BLOCK_K):
+            k_blk   = k_start // BLOCK_K
+            k_range = k_start + tl.arange(0, BLOCK_K)
+            k_mask  = k_range < K
 
-        # FP8 weight  [BN, BK]
-        w_ptrs  = w2_base + n_range[:, None] * stride_w2_n + k_range[None, :]
-        w_fp8   = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_scales = tl.load(
-            w2s_base + n_blks * stride_w2s_nb + k_blk,
-            mask=n_mask, other=1.0,
-        )
+            # Load intermediate (float32) — baseline precision path.
+            i_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + k_range[None, :]
+            i_f32  = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-        # Dequant to float32, then dot — no BF16 intermediate, matches baseline precision
-        w_f32  = w_fp8.to(tl.float32) * w_scales[:, None]  # [BN, BK]
-        acc   += tl.dot(i_f32, tl.trans(w_f32), out_dtype=tl.float32)
+            # FP8 weight [BN, BK]
+            w_ptrs  = w2_base + n_range[:, None] * stride_w2_n + k_range[None, :]
+            w_fp8   = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w_scales = tl.load(
+                w2s_base + n_blks * stride_w2s_nb + k_blk,
+                mask=n_mask, other=1.0,
+            )
 
-    # Apply routing weight and scatter-add (multiple experts → same output token row)
-    acc      = acc * weight[:, None]
-    out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
-    tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+            # Dequant to fp32 then dot — baseline precision for GEMM2.
+            w_f32 = w_fp8.to(tl.float32) * w_scales[:, None]   # [BN, BK]
+            acc  += tl.dot(i_f32, tl.trans(w_f32), out_dtype=tl.float32)
+
+        acc      = acc * weight[:, None]
+        out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
+        tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -483,14 +505,10 @@ def kernel(
         stride_inter_tok  = inter_buf.stride(0),
     )
 
-    # 5. Grouped GEMM2 — atomic scatter-add to output_f32
-    grouped_gemm2_kernel[
-        lambda meta: (
-            NUM_LOCAL_EXPERTS * triton.cdiv(max_tok, meta["BLOCK_M"]),
-            triton.cdiv(HIDDEN_DIM, meta["BLOCK_N"]),
-        )
-    ](
-        sorted_tok_ids, sorted_r_scores, expert_offsets, max_tok,
+    # 5. Grouped GEMM2 (persistent) — atomic scatter-add to output_f32.
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    grouped_gemm2_kernel[(NUM_SMS,)](
+        sorted_tok_ids, sorted_r_scores, expert_offsets,
         inter_buf,
         gemm2_weights, gemm2_weights_scale,
         output_f32,
@@ -499,6 +517,8 @@ def kernel(
         _bucket(N_assigned),
         K=INTER_DIM,
         N=HIDDEN_DIM,
+        E=NUM_LOCAL_EXPERTS,
+        NUM_SMS=NUM_SMS,
         stride_inter_tok  = inter_buf.stride(0),
         stride_w2_exp     = gemm2_weights.stride(0),
         stride_w2_n       = gemm2_weights.stride(1),

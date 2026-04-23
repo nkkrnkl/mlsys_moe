@@ -359,13 +359,9 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
 
                 # ---- Isolate GEMM2: run Triton grouped_gemm2_kernel vs pytorch ----
                 output_kern_gemm2 = torch.zeros(seq_len, H_, dtype=torch.float32, device="cuda")
-                mod.grouped_gemm2_kernel[
-                    lambda meta: (
-                        32 * triton.cdiv(max_tok_dbg, meta["BLOCK_M"]),
-                        triton.cdiv(H_, meta["BLOCK_N"]),
-                    )
-                ](
-                    sorted_tok_ids_dbg, sorted_rs_dbg, expert_offsets_dbg, max_tok_dbg,
+                NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+                mod.grouped_gemm2_kernel[(NUM_SMS,)](
+                    sorted_tok_ids_dbg, sorted_rs_dbg, expert_offsets_dbg,
                     inter_py,  # use correct pytorch inter so we isolate GEMM2 alone
                     tensors["gemm2_weights"], tensors["gemm2_weights_scale"],
                     output_kern_gemm2,
@@ -374,6 +370,8 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
                     _bkt(N_assigned_dbg),
                     K=I_,
                     N=H_,
+                    E=32,
+                    NUM_SMS=NUM_SMS,
                     stride_inter_tok  = inter_py.stride(0),
                     stride_w2_exp     = tensors["gemm2_weights"].stride(0),
                     stride_w2_n       = tensors["gemm2_weights"].stride(1),
