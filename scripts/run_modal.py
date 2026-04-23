@@ -301,15 +301,11 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
                 w1_t = tensors["gemm1_weights"]
                 w1s_t = tensors["gemm1_weights_scale"]
 
-                # Kernel path: fused GEMM1+SwiGLU writes inter directly
+                # Kernel path: fused GEMM1+SwiGLU (persistent) writes inter directly
                 inter_kern = torch.empty(N_assigned_dbg, I_, dtype=torch.float32, device="cuda")
-                mod.grouped_gemm1_kernel[
-                    lambda meta: (
-                        32 * triton.cdiv(max_tok_dbg, meta["BLOCK_M"]),
-                        triton.cdiv(I_, meta["BLOCK_N"]),
-                    )
-                ](
-                    sorted_tok_ids_dbg, expert_offsets_dbg, max_tok_dbg,
+                NUM_SMS_DBG = torch.cuda.get_device_properties("cuda").multi_processor_count
+                mod.grouped_gemm1_kernel[(NUM_SMS_DBG,)](
+                    sorted_tok_ids_dbg, expert_offsets_dbg,
                     hs_t, hss_t,
                     w1_t, w1s_t,
                     inter_kern,
@@ -317,6 +313,8 @@ def debug_kernel(solution: Solution, workload_uuid: str = None) -> str:
                     _bkt(N_assigned_dbg),
                     K=H_,
                     N=I_,
+                    E=32,
+                    NUM_SMS=NUM_SMS_DBG,
                     stride_h_seq      = hs_t.stride(0),
                     stride_w1_exp     = w1_t.stride(0),
                     stride_w1_n       = w1_t.stride(1),

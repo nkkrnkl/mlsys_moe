@@ -171,29 +171,31 @@ def _sort_tokens(expert_ids, weights_full, local_offset, device):
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: Grouped GEMM1 with fused SwiGLU epilogue
+# Kernel 1: Grouped GEMM1 with fused SwiGLU — PERSISTENT scheduler
 #
 # For every sorted position m and output column c ∈ [0, INTER_DIM):
 #   up   [m, c] = hidden[tok_ids[m]] @ w1[e, c,            :].T
 #   gate [m, c] = hidden[tok_ids[m]] @ w1[e, INTER_DIM + c, :].T
 #   inter[m, c] = silu(gate[m, c]) * up[m, c]
 #
-# The grid tiles over INTER_DIM columns (not GATE_UP_DIM), so each tile
-# computes a BLOCK_N-wide slice of inter directly. Per inner K iteration we
-# run two FP8 MMAs sharing the hidden load — one against the "up" weight
-# rows [0, INTER_DIM), one against the "gate" weight rows [INTER_DIM, 2*INTER_DIM).
-# Both 128-K-block scale drains happen in-register; SwiGLU is applied once
-# at the end and the result is stored to inter_buf.
+# Persistent schedule: grid = (NUM_SMS,). Each CTA precomputes per-expert
+# m-tile counts from expert_offsets and prefix-sums them, then loops
+# tile_id = pid, pid+NUM_SMS, ... until total_tiles. This eliminates the
+# early-return waste that the old grid-by-max_tok approach suffered on
+# imbalanced experts.
 #
-# Grid: (NUM_LOCAL_EXPERTS * ceil(max_tok / BLOCK_M),  ceil(INTER_DIM / BLOCK_N))
+# Each tile computes a BLOCK_N-wide slice of inter directly. Per inner K
+# iteration we run two FP8 MMAs sharing the hidden load — one against the
+# "up" weight rows [0, INTER_DIM), one against the "gate" weight rows
+# [INTER_DIM, 2*INTER_DIM). Both 128-K-block scale drains happen
+# in-register; SwiGLU is applied once at the end and stored to inter_buf.
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_gemm1_configs(), key=["n_assigned_bucket", "N"])
 @triton.jit
 def grouped_gemm1_kernel(
     # Sorted token data
     sorted_tok_ids_ptr,    # [N_assigned] int32
-    expert_offsets_ptr,    # [33]         int32
-    max_tok,               # int
+    expert_offsets_ptr,    # [E+1]        int32
 
     # Hidden states (full sequence, gather via tok_ids)
     hidden_ptr,            # [seq_len, 7168]   fp8_e4m3fn
@@ -211,6 +213,7 @@ def grouped_gemm1_kernel(
     # Shape constants
     K: tl.constexpr,       # 7168
     N: tl.constexpr,       # 2048 (= INTER_DIM)
+    E: tl.constexpr,       # 32 (NUM_LOCAL_EXPERTS)
 
     # Strides
     stride_h_seq,
@@ -221,89 +224,100 @@ def grouped_gemm1_kernel(
     stride_hscale_blk,
     stride_inter_tok,
 
-    # Block sizes
+    # Block sizes + persistent parallelism
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # always 128
+    NUM_SMS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
 
-    tiles_per_expert = tl.cdiv(max_tok, BLOCK_M)
-    expert_id        = pid_m // tiles_per_expert
-    m_in_expert      = pid_m %  tiles_per_expert
+    # Per-expert m-tile prefix (32-wide vector in-register).
+    idx_e       = tl.arange(0, E)
+    starts      = tl.load(expert_offsets_ptr + idx_e)       # [E]
+    ends        = tl.load(expert_offsets_ptr + idx_e + 1)   # [E]
+    counts      = ends - starts                              # [E]
+    mtiles      = tl.cdiv(counts, BLOCK_M)                   # [E]
+    prefix_inc  = tl.cumsum(mtiles, axis=0)                  # [E]
+    prefix_exc  = prefix_inc - mtiles                         # [E]
+    total_m_tiles = tl.sum(mtiles, axis=0)
 
-    e_start      = tl.load(expert_offsets_ptr + expert_id)
-    e_end        = tl.load(expert_offsets_ptr + expert_id + 1)
-    n_expert_tok = e_end - e_start
+    n_tiles     = tl.cdiv(N, BLOCK_N)
+    total_tiles = total_m_tiles * n_tiles
 
-    m_off = m_in_expert * BLOCK_M
-    if m_off >= n_expert_tok:
-        return
+    for tile_id in tl.range(pid, total_tiles, NUM_SMS):
+        m_tile_id = tile_id // n_tiles
+        n_tile_id = tile_id %  n_tiles
 
-    m_range  = m_off + tl.arange(0, BLOCK_M)
-    m_mask   = m_range < n_expert_tok
-    global_m = e_start + m_range
+        expert_id     = tl.sum((prefix_inc <= m_tile_id).to(tl.int32), axis=0)
+        sel           = (idx_e == expert_id).to(tl.int32)
+        m_tile_base   = tl.sum(prefix_exc * sel, axis=0)
+        e_start       = tl.sum(starts     * sel, axis=0)
+        n_expert_tok  = tl.sum(counts     * sel, axis=0)
 
-    tok_ids = tl.load(sorted_tok_ids_ptr + global_m, mask=m_mask, other=0)
+        m_in_expert = m_tile_id - m_tile_base
+        m_off       = m_in_expert * BLOCK_M
+        m_range     = m_off + tl.arange(0, BLOCK_M)
+        m_mask      = m_range < n_expert_tok
+        global_m    = e_start + m_range
 
-    n_start      = pid_n * BLOCK_N
-    n_range      = n_start + tl.arange(0, BLOCK_N)                  # "up"   cols in [0, INTER_DIM)
-    n_mask       = n_range < N
-    n_range_gate = n_range + N                                       # "gate" rows in [INTER_DIM, 2*INTER_DIM)
+        tok_ids = tl.load(sorted_tok_ids_ptr + global_m, mask=m_mask, other=0)
 
-    n_blks_up   = n_range      // BLOCK_K                            # weight-scale n-block indices
-    n_blks_gate = n_range_gate // BLOCK_K
+        n_start      = n_tile_id * BLOCK_N
+        n_range      = n_start + tl.arange(0, BLOCK_N)         # "up"   cols in [0, INTER_DIM)
+        n_mask       = n_range < N
+        n_range_gate = n_range + N                              # "gate" rows in [INTER_DIM, 2*INTER_DIM)
 
-    w1_base  = w1_ptr      + expert_id * stride_w1_exp
-    w1s_base = w1scale_ptr + expert_id * stride_w1s_exp
+        n_blks_up   = n_range      // BLOCK_K
+        n_blks_gate = n_range_gate // BLOCK_K
 
-    acc_up   = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    acc_gate = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        w1_base  = w1_ptr      + expert_id * stride_w1_exp
+        w1s_base = w1scale_ptr + expert_id * stride_w1s_exp
 
-    for k_start in tl.range(0, K, BLOCK_K):
-        k_blk   = k_start // BLOCK_K
-        k_range = k_start + tl.arange(0, BLOCK_K)
-        k_mask  = k_range < K
+        acc_up   = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        acc_gate = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-        # FP8 hidden  [BM, BK]  — shared between the up-MMA and the gate-MMA
-        h_ptrs  = hidden_ptr + tok_ids[:, None] * stride_h_seq + k_range[None, :]
-        h_fp8   = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-        h_scales = tl.load(
-            hscale_ptr + k_blk * stride_hscale_blk + tok_ids,
-            mask=m_mask, other=1.0,
-        )
+        for k_start in tl.range(0, K, BLOCK_K):
+            k_blk   = k_start // BLOCK_K
+            k_range = k_start + tl.arange(0, BLOCK_K)
+            k_mask  = k_range < K
 
-        # FP8 weight "up" half   [BN, BK]
-        w_up_ptrs  = w1_base + n_range[:, None] * stride_w1_n + k_range[None, :]
-        w_up_fp8   = tl.load(w_up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_up_scales = tl.load(
-            w1s_base + n_blks_up * stride_w1s_nb + k_blk,
-            mask=n_mask, other=1.0,
-        )
+            # FP8 hidden [BM, BK] — shared between up-MMA and gate-MMA
+            h_ptrs  = hidden_ptr + tok_ids[:, None] * stride_h_seq + k_range[None, :]
+            h_fp8   = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            h_scales = tl.load(
+                hscale_ptr + k_blk * stride_hscale_blk + tok_ids,
+                mask=m_mask, other=1.0,
+            )
 
-        # FP8 weight "gate" half [BN, BK]
-        w_gate_ptrs  = w1_base + n_range_gate[:, None] * stride_w1_n + k_range[None, :]
-        w_gate_fp8   = tl.load(w_gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_gate_scales = tl.load(
-            w1s_base + n_blks_gate * stride_w1s_nb + k_blk,
-            mask=n_mask, other=1.0,
-        )
+            # FP8 weight "up" half
+            w_up_ptrs  = w1_base + n_range[:, None] * stride_w1_n + k_range[None, :]
+            w_up_fp8   = tl.load(w_up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w_up_scales = tl.load(
+                w1s_base + n_blks_up * stride_w1s_nb + k_blk,
+                mask=n_mask, other=1.0,
+            )
 
-        # Two native FP8 MMAs sharing h_fp8; fp32 TC accumulators.
-        # DeepSeek-V3 N_C=128 two-level promotion: drain each per 128-K block.
-        acc_up_block   = tl.dot(h_fp8, tl.trans(w_up_fp8),   out_dtype=tl.float32)
-        acc_gate_block = tl.dot(h_fp8, tl.trans(w_gate_fp8), out_dtype=tl.float32)
+            # FP8 weight "gate" half
+            w_gate_ptrs  = w1_base + n_range_gate[:, None] * stride_w1_n + k_range[None, :]
+            w_gate_fp8   = tl.load(w_gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w_gate_scales = tl.load(
+                w1s_base + n_blks_gate * stride_w1s_nb + k_blk,
+                mask=n_mask, other=1.0,
+            )
 
-        acc_up   += acc_up_block   * h_scales[:, None] * w_up_scales[None, :]
-        acc_gate += acc_gate_block * h_scales[:, None] * w_gate_scales[None, :]
+            # Two native FP8 MMAs; fp32 TC accumulators; N_C=128 two-level drain.
+            acc_up_block   = tl.dot(h_fp8, tl.trans(w_up_fp8),   out_dtype=tl.float32)
+            acc_gate_block = tl.dot(h_fp8, tl.trans(w_gate_fp8), out_dtype=tl.float32)
 
-    # Fused SwiGLU epilogue: silu(gate) * up, where silu(x) = x * sigmoid(x).
-    inter_tile = (acc_gate / (1.0 + tl.exp(-acc_gate))) * acc_up
+            acc_up   += acc_up_block   * h_scales[:, None] * w_up_scales[None, :]
+            acc_gate += acc_gate_block * h_scales[:, None] * w_gate_scales[None, :]
 
-    out_m    = e_start + m_range
-    out_ptrs = inter_ptr + out_m[:, None] * stride_inter_tok + n_range[None, :]
-    tl.store(out_ptrs, inter_tile, mask=m_mask[:, None] & n_mask[None, :])
+        # Fused SwiGLU: silu(gate) * up.
+        inter_tile = (acc_gate / (1.0 + tl.exp(-acc_gate))) * acc_up
+
+        out_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + n_range[None, :]
+        tl.store(out_ptrs, inter_tile, mask=m_mask[:, None] & n_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -481,14 +495,11 @@ def kernel(
 
     inter_buf = torch.empty(N_assigned, INTER_DIM, dtype=torch.float32, device=device)
 
-    # 4. Grouped GEMM1 with fused SwiGLU — writes inter_buf directly
-    grouped_gemm1_kernel[
-        lambda meta: (
-            NUM_LOCAL_EXPERTS * triton.cdiv(max_tok, meta["BLOCK_M"]),
-            triton.cdiv(INTER_DIM, meta["BLOCK_N"]),
-        )
-    ](
-        sorted_tok_ids, expert_offsets, max_tok,
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+
+    # 4. Grouped GEMM1 + fused SwiGLU (persistent) — writes inter_buf directly.
+    grouped_gemm1_kernel[(NUM_SMS,)](
+        sorted_tok_ids, expert_offsets,
         hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_weights_scale,
         inter_buf,
@@ -496,6 +507,8 @@ def kernel(
         _bucket(N_assigned),
         K=HIDDEN_DIM,
         N=INTER_DIM,
+        E=NUM_LOCAL_EXPERTS,
+        NUM_SMS=NUM_SMS,
         stride_h_seq      = hidden_states.stride(0),
         stride_w1_exp     = gemm1_weights.stride(0),
         stride_w1_n       = gemm1_weights.stride(1),
@@ -506,7 +519,6 @@ def kernel(
     )
 
     # 5. Grouped GEMM2 (persistent) — atomic scatter-add to output_f32.
-    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
     grouped_gemm2_kernel[(NUM_SMS,)](
         sorted_tok_ids, sorted_r_scores, expert_offsets,
         inter_buf,
