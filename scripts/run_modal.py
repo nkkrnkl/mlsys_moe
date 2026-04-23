@@ -89,10 +89,13 @@ def print_results(results: dict):
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+                print(f" | ours {result['latency_ms']:.3f} ms", end="")
+
+            if result.get("reference_latency_ms") is not None:
+                print(f" | ref {result['reference_latency_ms']:.3f} ms", end="")
 
             if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
+                print(f" | {result['speedup_factor']:.2f}x", end="")
 
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
