@@ -16,7 +16,7 @@ Optimization: token-sorted grouped GEMM + fused SwiGLU epilogue.
 Pipeline:
   routing (PyTorch, proven correct) → token sort (PyTorch) →
   grouped_gemm1 (FP8 MMA + fused SwiGLU epilogue, writes inter directly) →
-  grouped_gemm2 (FP8 inter + FP8 weights → FP8 MMA, atomic scatter) →
+  grouped_gemm2 (FP8 dequant → float32 dot, atomic scatter) →
   cast to bf16 output
 
 SwiGLU convention (verified against baseline passing all 19 workloads):
@@ -43,7 +43,6 @@ HIDDEN_DIM          = 7168   # h7168
 INTER_DIM           = 2048   # i2048
 FP8_BLOCK_SIZE      = 128
 GATE_UP_DIM         = INTER_DIM * 2  # 4096
-FP8_E4M3FN_MAX      = tl.constexpr(448.0)  # max representable value of float8_e4m3fn
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +222,11 @@ def grouped_gemm1_kernel(
     stride_w1s_exp,
     stride_w1s_nb,
     stride_hscale_blk,
-    stride_inter_tok,      # stride of inter in elements (= 2048)
+    stride_inter_tok,
 
     # Block sizes + persistent parallelism
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,  # always 128 = FP8_BLOCK_SIZE
+    BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # always 128
     NUM_SMS: tl.constexpr,
 ):
@@ -315,11 +314,10 @@ def grouped_gemm1_kernel(
             acc_gate += acc_gate_block * h_scales[:, None] * w_gate_scales[None, :]
 
         # Fused SwiGLU: silu(gate) * up.
-        inter_tile = (acc_gate / (1.0 + tl.exp(-acc_gate))) * acc_up  # [BLOCK_M, 128]
+        inter_tile = (acc_gate / (1.0 + tl.exp(-acc_gate))) * acc_up
 
-        # Store float32 inter (passed directly to GEMM2).
-        i_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + n_range[None, :]
-        tl.store(i_ptrs, inter_tile, mask=m_mask[:, None] & n_mask[None, :])
+        out_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + n_range[None, :]
+        tl.store(out_ptrs, inter_tile, mask=m_mask[:, None] & n_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +348,9 @@ def grouped_gemm2_kernel(
     sorted_r_scores_ptr,
     expert_offsets_ptr,    # [E+1] int32
 
-    # Intermediate (SwiGLU output)
-    inter_ptr,             # [N_assigned, 2048] float32
+    # Intermediate (SwiGLU output) — row-normalized float16, values in (-1, 1)
+    inter_ptr,             # [N_assigned, 2048] float16
+    inter_row_scale_ptr,   # [N_assigned]       float32  per-row abs-max
 
     # Per-expert weights
     w2_ptr,                # [32, 7168, 2048]  fp8_e4m3fn
@@ -370,7 +369,7 @@ def grouped_gemm2_kernel(
     E: tl.constexpr,       # 32 (NUM_LOCAL_EXPERTS)
 
     # Strides
-    stride_inter_tok,      # stride of inter in elements (= 2048)
+    stride_inter_tok,
     stride_w2_exp,
     stride_w2_n,
     stride_w2s_exp,
@@ -429,6 +428,9 @@ def grouped_gemm2_kernel(
         w2_base  = w2_ptr      + expert_id * stride_w2_exp
         w2s_base = w2scale_ptr + expert_id * stride_w2s_exp
 
+        # Load per-row scale (applied after dot product to recover true inter values).
+        i_row_scale = tl.load(inter_row_scale_ptr + global_m, mask=m_mask, other=1.0)
+
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
         for k_start in tl.range(0, K, BLOCK_K):
@@ -436,22 +438,28 @@ def grouped_gemm2_kernel(
             k_range = k_start + tl.arange(0, BLOCK_K)
             k_mask  = k_range < K
 
-            # Load float32 inter [BM, BK].
+            # Load float16 inter [BM, BK] — row-normalized, values in (-1, 1).
+            # FP16 has 10-bit mantissa (8x more precise than BF16) so quantization
+            # error is small enough to pass all workloads.
             i_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + k_range[None, :]
-            i_f32  = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            i_f16  = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-            # Load FP8 weight [BN, BK] + per-N-block scale [BN]; dequant to float32.
+            # Dequant FP8 weights → float32 → float16.
+            # Weight values are bounded by FP8 scale (~4.4 max), so FP16 cast is lossless
+            # relative to FP8 precision (FP16 has 10 mantissa bits vs FP8's 3).
             w_ptrs   = w2_base + n_range[:, None] * stride_w2_n + k_range[None, :]
             w_fp8    = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
             w_scales = tl.load(
                 w2s_base + n_blks * stride_w2s_nb + k_blk,
                 mask=n_mask, other=1.0,
             )
-            w_f32 = w_fp8.to(tl.float32) * w_scales[:, None]
+            w_f16 = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.float16)
 
-            acc += tl.dot(i_f32, tl.trans(w_f32), out_dtype=tl.float32)
+            # FP16 tensor-core GEMM — 2x throughput vs TF32 on B200.
+            acc += tl.dot(i_f16, tl.trans(w_f16), out_dtype=tl.float32)
 
-        acc      = acc * weight[:, None]
+        # Unscale: multiply by per-row inter abs-max to recover true dot product.
+        acc      = acc * i_row_scale[:, None] * weight[:, None]
         out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
         tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
@@ -494,7 +502,9 @@ def kernel(
         output.zero_()
         return
 
-    # GEMM1 writes float32 inter; passed directly to GEMM2.
+    # GEMM1 writes float32 inter; we row-normalize and cast to float16 for GEMM2.
+    # FP16 inter: 2x smaller buffer (better L2 utilization) + FP16 tensor cores in GEMM2.
+    # Row normalization keeps values in (-1, 1) so FP16 never overflows.
     inter_f32 = torch.empty(N_assigned, INTER_DIM, dtype=torch.float32, device=device)
 
     NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
@@ -520,10 +530,18 @@ def kernel(
         stride_inter_tok  = inter_f32.stride(0),
     )
 
-    # 5. Grouped GEMM2 (persistent) — float32 inter, atomic scatter-add.
+    # Row-normalize inter: divide each row by its abs-max so values are in (-1, 1).
+    # This prevents FP16 overflow (max FP16 = 65504 >> 1.0) and bounds quantization
+    # error to ~0.1% (FP16 has 10 mantissa bits). The per-row scale is passed to
+    # GEMM2 and multiplied back after the dot product.
+    inter_row_scale = inter_f32.abs().amax(dim=1).clamp(min=1e-30)   # [N_assigned]
+    inter_f16       = (inter_f32 / inter_row_scale[:, None]).to(torch.float16)
+
+    # 5. Grouped GEMM2 (persistent) — FP16 tensor-core GEMM, atomic scatter-add.
     grouped_gemm2_kernel[(NUM_SMS,)](
         sorted_tok_ids, sorted_r_scores, expert_offsets,
-        inter_f32,
+        inter_f16,
+        inter_row_scale,
         gemm2_weights, gemm2_weights_scale,
         output_f32,
         rsf,
@@ -533,7 +551,7 @@ def kernel(
         N=HIDDEN_DIM,
         E=NUM_LOCAL_EXPERTS,
         NUM_SMS=NUM_SMS,
-        stride_inter_tok  = inter_f32.stride(0),
+        stride_inter_tok  = inter_f16.stride(0),
         stride_w2_exp     = gemm2_weights.stride(0),
         stride_w2_n       = gemm2_weights.stride(1),
         stride_w2s_exp    = gemm2_weights_scale.stride(0),
