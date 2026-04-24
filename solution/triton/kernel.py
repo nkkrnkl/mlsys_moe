@@ -351,7 +351,8 @@ def grouped_gemm2_kernel(
     expert_offsets_ptr,    # [E+1] int32
 
     # Intermediate (SwiGLU output)
-    inter_ptr,             # [N_assigned, 2048] float16  (cast from float32 in Python)
+    inter_ptr,             # [N_assigned, 2048] bfloat16  (row-normalized: values in [-1,1])
+    inter_row_scale_ptr,   # [N_assigned]       float32   (per-row abs-max used to normalize)
 
     # Per-expert weights
     w2_ptr,                # [32, 7168, 2048]  fp8_e4m3fn
@@ -429,6 +430,9 @@ def grouped_gemm2_kernel(
         w2_base  = w2_ptr      + expert_id * stride_w2_exp
         w2s_base = w2scale_ptr + expert_id * stride_w2s_exp
 
+        # Load per-row scale once: inter[m, :] was divided by this before BF16 cast.
+        i_row_scale = tl.load(inter_row_scale_ptr + global_m, mask=m_mask, other=1.0)  # [BM]
+
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
         for k_start in tl.range(0, K, BLOCK_K):
@@ -436,23 +440,24 @@ def grouped_gemm2_kernel(
             k_range = k_start + tl.arange(0, BLOCK_K)
             k_mask  = k_range < K
 
-            # Load FP16 intermediate [BM, BK].
+            # Load BF16 inter [BM, BK] — values in [-1, 1] (row-normalized).
             i_ptrs = inter_ptr + global_m[:, None] * stride_inter_tok + k_range[None, :]
-            i_f16  = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            i_bf16 = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-            # Load FP8 weight [BN, BK] + per-N-block scale [BN]; dequant to FP16.
+            # Load FP8 weight [BN, BK] + per-N-block scale [BN]; dequant to BF16.
             w_ptrs   = w2_base + n_range[:, None] * stride_w2_n + k_range[None, :]
             w_fp8    = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
             w_scales = tl.load(
                 w2s_base + n_blks * stride_w2s_nb + k_blk,
                 mask=n_mask, other=1.0,
             )
-            w_f16 = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.bfloat16)
+            w_bf16 = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.bfloat16)
 
-            # BF16 tensor-core GEMM: same throughput as FP16, same exponent range as FP32.
-            acc += tl.dot(i_f16, tl.trans(w_f16), out_dtype=tl.float32)
+            # BF16 tensor-core GEMM (2× throughput vs TF32 on B200).
+            acc += tl.dot(i_bf16, tl.trans(w_bf16), out_dtype=tl.float32)
 
-        acc      = acc * weight[:, None]
+        # Un-scale inter normalization: acc[m,n] × i_row_scale[m] recovers true value.
+        acc      = acc * i_row_scale[:, None] * weight[:, None]
         out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
         tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
@@ -522,16 +527,18 @@ def kernel(
         stride_inter_tok  = inter_f32.stride(0),
     )
 
-    # Cast float32 → bfloat16: 2× smaller inter buffer → 2× less GEMM2 K-read bandwidth.
-    # BF16 has the same exponent range as float32 (max ~3.4e38) so inter values that can
-    # reach ~363K after accumulated FP8 MMA don't overflow (FP16 max is only 65504).
-    # BF16 precision (~0.4% rel error) is well within benchmark tolerance.
-    inter_bf16 = inter_f32.to(torch.bfloat16)
+    # Row-normalize inter before BF16 cast: divides each row by its abs-max so values
+    # are in [-1, 1].  This bounds BF16 quantization error to ~0.78% regardless of
+    # activation magnitude (inter can reach ~363K which exceeds raw BF16 precision).
+    # The row scale is passed to GEMM2 and multiplied back after the dot product.
+    inter_row_scale = inter_f32.abs().amax(dim=1).clamp(min=1e-30)  # [N_assigned]
+    inter_bf16      = (inter_f32 / inter_row_scale[:, None]).to(torch.bfloat16)
 
     # 5. Grouped GEMM2 (persistent) — BF16 tensor-core GEMM, atomic scatter-add.
     grouped_gemm2_kernel[(NUM_SMS,)](
         sorted_tok_ids, sorted_r_scores, expert_offsets,
         inter_bf16,
+        inter_row_scale,
         gemm2_weights, gemm2_weights_scale,
         output_f32,
         rsf,
