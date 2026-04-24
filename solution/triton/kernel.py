@@ -447,9 +447,9 @@ def grouped_gemm2_kernel(
                 w2s_base + n_blks * stride_w2s_nb + k_blk,
                 mask=n_mask, other=1.0,
             )
-            w_f16 = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.float16)
+            w_f16 = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.bfloat16)
 
-            # FP16 tensor-core GEMM: 2× throughput vs TF32 on B200.
+            # BF16 tensor-core GEMM: same throughput as FP16, same exponent range as FP32.
             acc += tl.dot(i_f16, tl.trans(w_f16), out_dtype=tl.float32)
 
         acc      = acc * weight[:, None]
@@ -522,14 +522,16 @@ def kernel(
         stride_inter_tok  = inter_f32.stride(0),
     )
 
-    # Cast float32 → float16: 2× smaller inter buffer → 2× less GEMM2 K-read bandwidth.
-    # FP16 precision (~0.01% rel error) is well within benchmark tolerance.
-    inter_f16 = inter_f32.to(torch.float16)
+    # Cast float32 → bfloat16: 2× smaller inter buffer → 2× less GEMM2 K-read bandwidth.
+    # BF16 has the same exponent range as float32 (max ~3.4e38) so inter values that can
+    # reach ~363K after accumulated FP8 MMA don't overflow (FP16 max is only 65504).
+    # BF16 precision (~0.4% rel error) is well within benchmark tolerance.
+    inter_bf16 = inter_f32.to(torch.bfloat16)
 
-    # 5. Grouped GEMM2 (persistent) — FP16 tensor-core GEMM, atomic scatter-add.
+    # 5. Grouped GEMM2 (persistent) — BF16 tensor-core GEMM, atomic scatter-add.
     grouped_gemm2_kernel[(NUM_SMS,)](
         sorted_tok_ids, sorted_r_scores, expert_offsets,
-        inter_f16,
+        inter_bf16,
         gemm2_weights, gemm2_weights_scale,
         output_f32,
         rsf,
@@ -539,7 +541,7 @@ def kernel(
         N=HIDDEN_DIM,
         E=NUM_LOCAL_EXPERTS,
         NUM_SMS=NUM_SMS,
-        stride_inter_tok  = inter_f16.stride(0),
+        stride_inter_tok  = inter_bf16.stride(0),
         stride_w2_exp     = gemm2_weights.stride(0),
         stride_w2_n       = gemm2_weights.stride(1),
         stride_w2s_exp    = gemm2_weights_scale.stride(0),
