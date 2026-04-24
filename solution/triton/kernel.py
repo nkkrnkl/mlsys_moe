@@ -43,6 +43,7 @@ HIDDEN_DIM          = 7168   # h7168
 INTER_DIM           = 2048   # i2048
 FP8_BLOCK_SIZE      = 128
 GATE_UP_DIM         = INTER_DIM * 2  # 4096
+FP8_E4M3FN_MAX      = 448.0          # max representable value of float8_e4m3fn
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +323,6 @@ def grouped_gemm1_kernel(
 
         # Quantize to FP8 E4M3FN with per-row per-128-block scaling.
         # BLOCK_N == 128 == FP8_BLOCK_SIZE, so this tile is exactly one K-block per row.
-        FP8_E4M3FN_MAX: tl.constexpr = 448.0
         abs_max        = tl.max(tl.abs(inter_tile), axis=1)            # [BLOCK_M]
         iscale         = tl.maximum(abs_max, 1e-30) / FP8_E4M3FN_MAX  # [BLOCK_M]
         inter_fp8_tile = (inter_tile / iscale[:, None]).to(tl.float8e4m3fn)
